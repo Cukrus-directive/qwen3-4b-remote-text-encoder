@@ -1,0 +1,30 @@
+name: sync to hugging face
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install "huggingface_hub>=0.30"
+      - name: upload
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import upload_folder
+          upload_folder(
+              repo_id="cukrus/qwen3-4b-remote-text-encoder",
+              folder_path=".",
+              ignore_patterns=[".git/*", ".github/*", ".gitignore", "*.safetensors"],
+              commit_message="sync from github " + os.environ["GITHUB_SHA"][:7],
+          )
+          PY

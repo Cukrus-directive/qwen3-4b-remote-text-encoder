@@ -1,0 +1,17 @@
+[Unit]
+Description=Remote Qwen3-4B text encoder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/imgenc/venv/bin/python -W ignore /opt/imgenc/encode-server.py \
+    --model /opt/imgenc/models/qwen3-4b \
+    --host 0.0.0.0 --port 8090 --threads 6
+Restart=on-failure
+RestartSec=5
+# gets killed first if the box runs out of ram
+OOMScoreAdjust=300
+
+[Install]
+WantedBy=multi-user.target

@@ -11,18 +11,20 @@ tags:
 
 # Remote Qwen3-4B text encoder
 
-Runs the Qwen3-4B text encoder for Z-Image-Turbo and FLUX.2-klein-4B on a separate CPU
-machine and serves prompt embeddings over HTTP. The GPU machine only loads the DiT and VAE
-and passes the result as `prompt_embeds`.
+Before Z-Image-Turbo or FLUX.2-klein-4B can draw anything, a language model (Qwen3-4B) has to
+turn your prompt into numbers the image model understands. That step eats a lot of memory.
 
-Qwen3-4B is ~8 GB in bf16 and ~2.5 GB in 4-bit. Moving it off the GPU device frees that
-memory for the diffusion model.
+This server runs it on another computer's CPU and sends the result back over the network. The
+GPU machine only loads the image model.
+
+Qwen3-4B needs ~8 GB at full precision, or ~2.5 GB squeezed down to 4-bit. Moving it off the GPU
+gives all of that back to the image model.
 
 ```
 GPU machine                                  CPU machine
-  DiT + VAE                                    Qwen3-4B (bf16 weights)
-  prompt  ──── POST /v1/encode ─────────────►  encode, LRU cache
-          ◄─── safetensors (bf16 tensor) ────
+  image model                                  Qwen3-4B
+  prompt  ──── POST /v1/encode ─────────────►  encode (cached)
+          ◄─── prompt embeddings ────────────
   pipe(prompt_embeds=...)
 ```
 
@@ -30,48 +32,72 @@ No weights in this repo.
 
 | file | |
 |---|---|
-| `encode-server.py` | encoder service |
-| `imgenc.service` | systemd unit |
-| `client_example.py` | diffusers client for both models |
+| `encode-server.py` | the server |
+| `imgenc.service` | runs it as a Linux service |
+| `client_example.py` | how to use it from diffusers, both models |
 
-## Both models, one encoder
+## How it fits together
 
-Z-Image-Turbo and FLUX.2-klein-4B ship identical Qwen3-4B weights, tokenizer and chat
-template. Only the output differs, selected with `mode`:
+**Built for an 8 GB Jetson.** The Orin Nano can't hold Qwen3-4B next to an image model, so the
+encoder runs on a separate CPU machine.
 
-| mode | thinking | tokens | output |
-|---|---|---|---|
-| `zimage` | on | real tokens only | `hidden_states[-2]`, (n, 2560) |
-| `klein` | off | padded to 512 | `hidden_states[9, 18, 27]` stacked, (512, 7680) |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/orin-image-flow-dark.png">
+  <img src="assets/orin-image-flow-light.png" alt="Request flow: clients reach OpenWebUI, llama-swap on the Jetson Orin loads FLUX.2-klein, and the Qwen3-4B encoder on the Intel host sends back 7.5 MB of embeddings">
+</picture>
 
-klein has no text mask, so the pad positions affect the image. Keep all 512.
+A klein edit in progress. The Orin sends the prompt to the encoder on the Intel host and gets
+7.5 MB of embeddings back. With the encoder off the Orin, klein has 1.85 GB of memory to spare.
 
-## CPU: bf16 weights, fp32 compute
+- [OpenWebUI](https://github.com/open-webui/open-webui) takes chat, image and edit requests from clients on the LAN.
+- [llama-swap](https://github.com/mostlygeek/llama-swap) on the Orin keeps one model on the GPU at a time.
+- Z-Image-Turbo and FLUX.2-klein-4B get their `prompt_embeds` from this server.
+- SANA-Sprint uses Gemma-2-2B and encodes on the Orin.
 
-On CPUs without native bf16 (no AVX-512-BF16 / AMX), bf16 matmuls are emulated and slow.
-The server keeps the weights in bf16 (memory-mapped) and upcasts each Linear's weight to fp32
-at matmul time. Norms and the residual stream run in fp32.
+[Orin Image Flow](https://huggingface.co/spaces/cukrus/orin-image-flow) animates every request path
+with measured timings and memory. Source: [orin-image-flow](https://github.com/Cukrus-directive/orin-image-flow).
 
-Tested CPU: i7-13620H (AVX2, no native bf16), 6 threads.
+## One encoder, two models
 
-| | Z-Image, 61 tokens | klein, 512 tokens | rel. L2 vs bf16 | RAM |
+Both image models ship the exact same Qwen3-4B, so one server covers both. They want the result
+in a different shape, so you pick one with `mode`:
+
+| mode | what you get back | shape |
+|---|---|---|
+| `zimage` | one row per word-piece of your prompt | (n, 2560) |
+| `klein` | always 512 rows, padded, from three layers of the model | (512, 7680) |
+
+klein also reads the padding, so trimming it changes the picture. Always send all 512.
+
+## Why it's fast on a normal CPU
+
+The model files are stored in bf16, a compact number format. Most laptop and desktop CPUs can't
+do bf16 math directly, so running the model as-is is slow.
+
+**The trick:** keep the weights in bf16 so they stay small in RAM, and convert each layer to
+fp32 right before it's used. fp32 is what these CPUs are good at. Same memory, 3-5x faster,
+practically the same output.
+
+Tested on an i7-13620H laptop CPU, 6 threads:
+
+| | Z-Image, 61 tokens | klein, 512 tokens | difference from plain bf16 | RAM |
 |---|---|---|---|---|
-| bf16 | 4.95 s | 45-46 s | - | 7.9 GB |
-| **bf16 weights, fp32 compute** | **1.63 s** | **9.1-9.3 s** | 0.014-0.021 | 8.0 GB |
-| int8 dynamic | 0.48 s | 4.6-4.8 s | 0.55-0.65 | 5.9-7.1 GB |
+| plain bf16 | 4.95 s | 45-46 s | - | 7.9 GB |
+| **this server** | **1.63 s** | **9.1-9.3 s** | 1.4-2.1% | 8.0 GB |
+| int8 | 0.48 s | 4.6-4.8 s | 55-65% | 5.9-7.1 GB |
 
-int8 dynamic quantization is not used: per-tensor activation quantization breaks on Qwen3's
-outlier channels.
+int8 is faster but changes the output far too much. Qwen3 has a few unusually large values that
+int8 can't store accurately.
 
-Short Z-Image prompts (~20 tokens) take ~1.2 s. Repeat prompts are served from cache.
-Response size: a few hundred KB for Z-Image, 7.5 MB for klein.
+Short Z-Image prompts take ~1.2 s. Send the same prompt again and it comes straight from the
+cache. Each response is a few hundred KB for Z-Image and 7.5 MB for klein.
 
 ## Tested setup
 
 - GPU side: Jetson Orin Nano 8GB, JetPack 7.2, torch 2.12.1+cu132, diffusers 0.39
 - CPU side: i7-13620H, torch 2.14.1+cpu, transformers 5.19
 
-| model on the GPU side | 1024px | system RAM free (min) |
+| model on the GPU side | 1024px | lowest free memory |
 |---|---|---|
 | [Z-Image-Turbo bnb-4bit](https://huggingface.co/unsloth/Z-Image-Turbo-unsloth-bnb-4bit), 9 steps | ~75 s | 1.4 GB |
 | [FLUX.2-klein-4B NF4](https://huggingface.co/cukrus/FLUX.2-klein-4B-bnb-nf4), 4 steps, edit | ~45-58 s | 1.85 GB |
@@ -101,9 +127,8 @@ venv/bin/python encode-server.py --model /path/to/model --threads 6
 curl -s localhost:8090/health
 ```
 
-GPU machine: load the pipeline with `text_encoder=None, tokenizer=None` and pass
-`prompt_embeds`. Z-Image takes a list of (n, 2560) tensors, klein takes (1, 512, 7680).
-See `client_example.py`.
+GPU machine: load the pipeline without its own text encoder (`text_encoder=None, tokenizer=None`)
+and pass the server's output as `prompt_embeds`. `client_example.py` does this for both models.
 
 ```bash
 ENCODER_URL=http://<cpu-host>:8090/v1/encode python client_example.py zimage "a red fox in snow"
@@ -119,4 +144,4 @@ POST /v1/encode  {"prompt": "...", "mode": "zimage" | "klein"}
 GET  /health
 ```
 
-No auth. LAN only.
+No auth. Keep it on your local network.

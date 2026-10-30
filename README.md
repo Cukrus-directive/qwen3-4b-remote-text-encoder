@@ -41,10 +41,7 @@ No weights in this repo.
 **Built for an 8 GB Jetson.** The Orin Nano can't hold Qwen3-4B next to an image model, so the
 encoder runs on a separate CPU machine.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/orin-image-flow-dark.png">
-  <img src="assets/orin-image-flow-light.png" alt="Request flow: clients reach OpenWebUI, llama-swap on the Jetson Orin loads FLUX.2-klein, and the Qwen3-4B encoder on the Intel host sends back 7.5 MB of embeddings">
-</picture>
+<img src="assets/orin-image-flow-dark.png" alt="Request flow: clients reach OpenWebUI, llama-swap on the Jetson Orin loads FLUX.2-klein, and the Qwen3-4B encoder on the Intel host sends back 7.5 MB of embeddings">
 
 A klein edit in progress. The Orin sends the prompt to the encoder on the Intel host and gets
 7.5 MB of embeddings back. With the encoder off the Orin, klein has 1.85 GB of memory to spare.
